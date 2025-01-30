@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import axios from 'axios';
 import { exec } from 'child_process';
 
+let abortController: AbortController | null = null;
 let cachedModelName: string | undefined;
 let lastKnownCustomModel: string | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
@@ -52,31 +53,26 @@ function createStatusBarItem() {
     return statusBarItem;
 }
 
-
-
 async function startOllama(): Promise<void> {
     try {
         await axios.get('http://localhost:11434/api/tags');
-        
         const modelName = await getModelName();
         console.log('Selected model:', modelName);
-        
+
         try {
-            // Test if model exists
             const testResponse = await axios.post(OLLAMA_API_URL, {
                 model: modelName,
                 prompt: "test",
                 stream: false
             });
             console.log('Model test successful:', testResponse.status);
-            
         } catch (error: any) {
             console.log('Model test error:', {
                 message: error.message,
                 status: error.response?.status,
                 data: error.response?.data
             });
-            
+
             // Handle both 404 and 400 status codes for model download
             if (error.response?.status === 404 || error.response?.status === 400 || 
                 (error.message && error.message.includes('model not found'))) {
@@ -84,10 +80,10 @@ async function startOllama(): Promise<void> {
                 const statusBar = createStatusBarItem();
                 statusBar.text = "$(sync~spin) Initializing download...";
                 statusBar.show();
-                
+
                 console.log(`Starting download for model: ${modelName}`);
                 const child = exec(`ollama pull ${modelName}`);
-                
+
                 // Handle progress updates through stderr
                 child.stderr?.on('data', (data: string) => {
                     const output = data.toString();
@@ -101,13 +97,12 @@ async function startOllama(): Promise<void> {
                         
                         // Convert to GB for display
                         const downloadedGB = downloadedUnit === 'GB' ? 
-                            parseFloat(downloaded) : 
-                            parseFloat(downloaded) / 1024;
-                            
+                            parseFloat(downloaded as any) : 
+                            parseFloat(downloaded as any) / 1024;
                         const totalGB = totalUnit === 'GB' ? 
-                            parseFloat(total) : 
-                            parseFloat(total) / 1024;
-                        
+                            parseFloat(total as any) : 
+                            parseFloat(total as any) / 1024;
+
                         if (statusBarItem) {
                             const newText = `$(sync~spin) Downloading ${modelName}: ${downloadedGB.toFixed(2)}GB / ${totalGB.toFixed(2)}GB (${progress}%)`;
                             console.log('Updating status bar:', newText);
@@ -117,7 +112,7 @@ async function startOllama(): Promise<void> {
                 });
 
                 await new Promise<void>((resolve, reject) => {
-                    child.on('close', (code) => {
+                    child.on("close", (code) => {
                         console.log('Process closed with code:', code);
                         if (code === 0) {
                             if (statusBarItem) {
@@ -135,13 +130,11 @@ async function startOllama(): Promise<void> {
                             reject(new Error(`Download failed with code ${code}. Model "${modelName}" may not exist.`));
                         }
                     });
-                    child.on('error', (error) => {
+                    child.on('error', (error: Error) => {
                         console.error('Process error:', error);
                         reject(error);
                     });
                 });
-            } else {
-                throw error;
             }
         }
     } catch (error: any) {
@@ -164,22 +157,26 @@ async function startOllama(): Promise<void> {
     }
 }
 
-
 async function queryOllama(prompt: string, webview: vscode.Webview): Promise<string> {
     try {
+        if (abortController) {
+            abortController.abort();
+        }
+
         const modelName = await getModelName();
         console.log('Querying with model:', modelName);
-        
+        abortController = new AbortController();
+
         const response = await axios.post(OLLAMA_API_URL, {
             model: modelName,
             prompt: prompt,
             stream: true
         }, {
-            responseType: 'stream',
-            validateStatus: (status) => {
-                return status < 500; // Accept 400-level errors to handle them
+                responseType: 'stream',
+                signal: abortController.signal,
+                validateStatus: (status) => status < 500
             }
-        });
+        );
 
         if (response.status === 400) {
             throw new Error(`Invalid request for model "${modelName}". The model may not exist.`);
@@ -187,21 +184,38 @@ async function queryOllama(prompt: string, webview: vscode.Webview): Promise<str
 
         let fullResponse = '';
         return new Promise((resolve, reject) => {
+            const cleanup = () => {
+                abortController = null;
+                webview.postMessage({ type: "end" });
+            };
+
             response.data.on('data', (chunk: Buffer) => {
                 try {
-                    const chunkStr = chunk.toString();
-                    const parsed = JSON.parse(chunkStr);
-                    fullResponse += parsed.response;
-                    webview.postMessage({ type: 'response', content: fullResponse });
+                    const lines = chunk.toString().split("\n").filter(line => line.trim());
+                    for (const line of lines) {
+                        const parsed = JSON.parse(line);
+                        if (parsed.response) {
+                            fullResponse += parsed.response;
+                            webview.postMessage({ type: "response", content: fullResponse });
+                        }
+                    }
                 } catch (e) {
-                    console.error('Error parsing chunk:', e);
+                    console.error('Error parsing chunk: ', e);
                 }
             });
 
-            response.data.on('end', () => resolve(fullResponse));
-            response.data.on('error', reject);
+            response.data.on('end', () => {
+                cleanup();
+                resolve(fullResponse);
+            });
+
+            response.data.on('error', (error: Error) => {
+                cleanup();
+                error.name === "AbortError" ? resolve(fullResponse) : reject(error);
+            });
         });
     } catch (error) {
+        webview.postMessage({ type: "end" });
         console.error('Error querying Ollama:', error);
         throw error;
     }
@@ -218,14 +232,22 @@ async function createChatPanel() {
 
     panel.webview.html = getWebviewContent();
 
-    panel.webview.onDidReceiveMessage(async message => {
-        if (message.type === 'prompt') {
-            try {
-                await startOllama();
-                await queryOllama(message.content, panel.webview);
-            } catch (error) {
-                vscode.window.showErrorMessage('Failed to query DeepSeek. Make sure Ollama is running.');
-            }
+    panel.webview.onDidReceiveMessage(async (message) => {
+        switch (message.type) {
+            case 'prompt':
+                try {
+                    await startOllama();
+                    await queryOllama(message.content, panel.webview);
+                } catch (error) {
+                    vscode.window.showErrorMessage('Chat was stopped due to an error or user abort.');
+                    panel.webview.postMessage({ type: 'end' });
+                }
+                break;
+            case 'stop':
+                if (abortController) {
+                    abortController.abort();
+                }
+                break;
         }
     });
 }
@@ -238,39 +260,46 @@ class SeekerViewProvider implements vscode.WebviewViewProvider {
         context: vscode.WebviewViewResolveContext,
         _token: vscode.CancellationToken
     ) {
-        webviewView.webview.options = {
-            enableScripts: true
-        };
-
+        webviewView.webview.options = { enableScripts: true };
         webviewView.webview.html = getWebviewContent();
 
-        webviewView.webview.onDidReceiveMessage(async message => {
-            if (message.type === 'prompt') {
-                try {
-                    await startOllama();
-                    await queryOllama(message.content, webviewView.webview);
-                } catch (error) {
-                    vscode.window.showErrorMessage('Failed to query DeepSeek. Make sure Ollama is running.');
-                }
+        webviewView.webview.onDidReceiveMessage(async (message) => {
+            switch (message.type) {
+                case 'prompt':
+                    try {
+                        await startOllama();
+                        await queryOllama(message.content, webviewView.webview);
+                    } catch (error) {
+                        vscode.window.showErrorMessage('Chat was stopped due to an error or user abort.');
+                        webviewView.webview.postMessage({ type: 'end' });
+                    }
+                    break;
+                case 'stop':
+                    if (abortController) {
+                        abortController.abort();
+                    }
+                    break;
             }
         });
     }
 }
 
 export function activate(context: vscode.ExtensionContext) {
-    // Register the sidebar webview provider
     const provider = new SeekerViewProvider(context.extensionUri);
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider('seekerChat', provider)
     );
 
-    // Register the command to open the chat panel
     let disposable = vscode.commands.registerCommand('seeker.query', createChatPanel);
     context.subscriptions.push(disposable);
 }
 
 export function deactivate() {
     cachedModelName = undefined; // Clear the cache
+    if (abortController) {
+        abortController.abort();
+        abortController = null;
+    }
     if (statusBarItem) {
         statusBarItem.hide();
         statusBarItem.dispose();
@@ -287,14 +316,15 @@ export function deactivate() {
         });
     });
 }
+
 function getWebviewContent() {
-	return /*html*/`
+    return /*html*/`
         <!DOCTYPE html>
         <html>
         <head>
             <meta charset="UTF-8">
             <style>
-				html, body { 
+                html, body { 
                     margin: 0;
                     padding: 0;
                     height: 100vh;
@@ -323,19 +353,19 @@ function getWebviewContent() {
                     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
                 }
                 .message {
-    padding: 12px 16px;
-    border-radius: 12px;
-    max-width: 85%;
-    font-size: 14px;
-    white-space: pre-wrap;
-    word-wrap: break-word;
-}
+                    padding: 12px 16px;
+                    border-radius: 12px;
+                    max-width: 85%;
+                    font-size: 14px;
+                    white-space: pre-wrap;
+                    word-wrap: break-word;
+                }
                 .message-container {
-    display: flex;
-    flex-direction: column;
-    margin-bottom: 20px;
-    width: 100%;
-}
+                    display: flex;
+                    flex-direction: column;
+                    margin-bottom: 20px;
+                    width: 100%;
+                }
                 .user-message {
                     background: var(--vscode-button-background);
                     color: var(--vscode-button-foreground);
@@ -348,7 +378,7 @@ function getWebviewContent() {
                     align-self: flex-start;
                     box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
                 }
-				.assistant-message-container {
+                .assistant-message-container {
                     align-items: flex-start;
                 }
                 #input-container {
@@ -357,6 +387,7 @@ function getWebviewContent() {
                     background: var(--vscode-editor-background);
                     border-radius: 12px;
                     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+                    padding: 8px;
                 }
                 #prompt-input { 
                     flex: 1;
@@ -376,7 +407,7 @@ function getWebviewContent() {
                     outline: none;
                     border-color: var(--vscode-focusBorder);
                 }
-                #submit-button { 
+                #submit-button, #stop-button { 
                     padding: 12px 24px;
                     background: var(--vscode-button-background);
                     color: var(--vscode-button-foreground);
@@ -385,23 +416,46 @@ function getWebviewContent() {
                     cursor: pointer;
                     font-size: 14px;
                     font-weight: 500;
-                    transition: background-color 0.2s ease;
+                    transition: all 0.2s ease;
                     display: flex;
                     align-items: center;
                     gap: 8px;
                 }
-                #submit-button:hover {
-                    background: var(--vscode-button-hoverBackground);
+                #stop-button {
+                    background: var(--vscode-errorForeground);
+                    display: none;
                 }
-                #submit-button:active {
+                #submit-button:hover, #stop-button:hover {
+                    opacity: 0.9;
+                    transform: translateY(-1px);
+                }
+                #stop-button:hover {
+                    background: var(--vscode-testing-iconFailed);
+                }
+                #submit-button:active, #stop-button:active {
                     transform: translateY(1px);
                 }
-                .message-time {
-					font-size: 11px;
-					color: var(--vscode-descriptionForeground);
-					margin-top: 4px;
-					padding: 0 4px;
-				}
+                .button-container {
+                    display: flex;
+                    gap: 8px;
+                }
+                .loading-dots {
+                    display: inline-block;
+                    width: 20px;
+                    animation: dots 1.5s infinite;
+                }
+                .loading-dots::after {
+                    content: '...';
+                }
+                @keyframes dots {
+                    0%, 20% { content: '.'; }
+                    40% { content: '..'; }
+                    60% { content: '...'; }
+                    80% { content: '....'; }
+                }
+                .processing {
+                    opacity: 0.7;
+                }
                 /* Scrollbar styling */
                 ::-webkit-scrollbar {
                     width: 4px;
@@ -416,7 +470,7 @@ function getWebviewContent() {
                     border-radius: 4px;
                     transition: background 0.2s ease;
                 }
-				::-webkit-scrollbar-thumb:hover {
+                ::-webkit-scrollbar-thumb:hover {
                     background: var(--vscode-scrollbarSlider-hoverBackground);
                 }
             </style>
@@ -429,80 +483,129 @@ function getWebviewContent() {
                     placeholder="Type your message here..."
                     rows="1"
                 ></textarea>
-                <button id="submit-button">
-                    <span>Send</span>
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
-                    </svg>
-                </button>
+                <div class="button-container">
+                    <button id="submit-button">
+                        <span>Send</span>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
+                        </svg>
+                    </button>
+                    <button id="stop-button">
+                        <span>Stop</span>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                        </svg>
+                    </button>
+                </div>
             </div>
             <script>
-                const vscode = acquireVsCodeApi();
-                const chatContainer = document.getElementById('chat-container');
-                const promptInput = document.getElementById('prompt-input');
-                const submitButton = document.getElementById('submit-button');
+                (function() {
+                    const vscode = acquireVsCodeApi();
+                    const chatContainer = document.getElementById('chat-container');
+                    const promptInput = document.getElementById('prompt-input');
+                    const submitButton = document.getElementById('submit-button');
+                    const stopButton = document.getElementById('stop-button');
+                    let isGenerating = false;
 
-                function getFormattedTime() {
-                    return new Date().toLocaleTimeString([], { 
-                        hour: '2-digit', 
-                        minute: '2-digit' 
-                    });
-                }
-
-                function addMessage(content, isUser = false) {
-    const messageContainer = document.createElement('div');
-    messageContainer.className = \`message-container \${isUser ? 'user-message-container' : 'assistant-message-container'}\`;
-    
-    const messageWrapper = document.createElement('div');
-    messageWrapper.style.cssText = \`display: flex; flex-direction: column; \${isUser ? 'align-items: flex-end;' : 'align-items: flex-start;'}\`;
-
-    const messageDiv = document.createElement('div');
-    messageDiv.className = \`message \${isUser ? 'user-message' : 'assistant-message'}\`;
-    messageDiv.textContent = content;
-
-    const timeDiv = document.createElement('div');
-    timeDiv.className = 'message-time';
-    timeDiv.textContent = getFormattedTime();
-
-    messageWrapper.appendChild(messageDiv);
-    messageWrapper.appendChild(timeDiv);
-    messageContainer.appendChild(messageWrapper);
-    chatContainer.appendChild(messageContainer);
-    chatContainer.scrollTop = chatContainer.scrollHeight;
-}
-                
-                submitButton.addEventListener('click', () => {
-                    const prompt = promptInput.value.trim();
-                    if (prompt) {
-                        addMessage(prompt, true);
-                        vscode.postMessage({ type: 'prompt', content: prompt });
-                        promptInput.value = '';
+                    function getFormattedTime() {
+                        return new Date().toLocaleTimeString([], { 
+                            hour: '2-digit', 
+                            minute: '2-digit' 
+                        });
                     }
-                });
 
-                promptInput.addEventListener('keydown', (e) => {
-                    if (e.key === 'Enter' && !e.shiftKey) {
-                        e.preventDefault();
-                        submitButton.click();
-                    }
-                });
+                    function toggleButtons(showStop) {
+                        submitButton.style.display = showStop ? 'none' : 'flex';
+                        stopButton.style.display = showStop ? 'flex' : 'none';
+                        promptInput.disabled = showStop;
+                        isGenerating = showStop;
 
-                window.addEventListener('message', event => {
-                    const message = event.data;
-                    if (message.type === 'response') {
-                        const lastMessage = chatContainer.lastElementChild;
-                        if (lastMessage?.querySelector('.assistant-message')) {
-                            lastMessage.remove();
+                        if (!showStop) {
+                            promptInput.focus();
                         }
-                        addMessage(message.content);
                     }
-                });
 
-                // Auto-resize textarea
-                promptInput.addEventListener('input', () => {
-                    promptInput.style.height = 'auto';
-                    promptInput.style.height = Math.min(promptInput.scrollHeight, 150) + 'px';
-                });
+                    function addMessage(content, isUser, isProcessing = false) {
+                        const messageContainer = document.createElement('div');
+                        messageContainer.className = isUser ? 'message-container user-message-container' : 'message-container assistant-message-container';
+                        
+                        const messageWrapper = document.createElement('div');
+                        messageWrapper.style.cssText = 'display: flex; flex-direction: column; ' + 
+                            (isUser ? 'align-items: flex-end' : 'align-items: flex-start');
+
+                        const messageDiv = document.createElement('div');
+                        messageDiv.className = isUser ? 'message user-message' : 'message assistant-message';
+                        
+                        if (isProcessing) {
+                            messageDiv.innerHTML = 'Processing your request<span class="loading-dots"></span>';
+                            messageDiv.classList.add('processing');
+                        } else {
+                            messageDiv.textContent = content;
+                        }
+
+                        const timeDiv = document.createElement('div');
+                        timeDiv.className = 'message-time';
+                        timeDiv.textContent = getFormattedTime();
+
+                        messageWrapper.appendChild(messageDiv);
+                        messageWrapper.appendChild(timeDiv);
+                        messageContainer.appendChild(messageWrapper);
+                        chatContainer.appendChild(messageContainer);
+                        chatContainer.scrollTop = chatContainer.scrollHeight;
+                    }
+                    
+                    submitButton.addEventListener('click', () => {
+                        const prompt = promptInput.value.trim();
+                        if (prompt && !isGenerating) {
+                            addMessage(prompt, true);
+                            addMessage('', false, true); // Add processing message
+                            vscode.postMessage({ type: 'prompt', content: prompt });
+                            promptInput.value = '';
+                            promptInput.style.height = '50px';
+                            toggleButtons(true);
+                        }
+                    });
+
+                    stopButton.addEventListener('click', () => {
+                        vscode.postMessage({ type: 'stop' });
+                        toggleButtons(false);
+                    });
+
+                    promptInput.addEventListener('keydown', (e) => {
+                        if (e.key === 'Enter' && !e.shiftKey && !isGenerating) {
+                            e.preventDefault();
+                            submitButton.click();
+                        }
+                    });
+
+                    window.addEventListener('message', (event) => {
+                        const message = event.data;
+                        switch (message.type) {
+                            case 'response':
+                                const lastMessage = chatContainer.lastElementChild;
+                                if (lastMessage && lastMessage.querySelector('.assistant-message')) {
+                                    lastMessage.remove();
+                                }
+                                addMessage(message.content, false);
+                                break;
+                            case 'end':
+                                toggleButtons(false);
+                                break;
+                            case 'error':
+                                toggleButtons(false);
+                                addMessage('Error: ' + message.content, false);
+                                break;
+                        }
+                    });
+
+                    promptInput.addEventListener('input', () => {
+                        promptInput.style.height = '50px';
+                        const newHeight = Math.min(promptInput.scrollHeight, 150);
+                        promptInput.style.height = newHeight + 'px';
+                    });
+
+                    promptInput.focus();
+                })();
             </script>
         </body>
         </html>
